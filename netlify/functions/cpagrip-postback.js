@@ -70,8 +70,8 @@ async function readBodyParams(req) {
 }
 
 function getSupabase() {
-  const url = Netlify.env.get("SUPABASE_URL");
-  const key = Netlify.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  const url = .env.get("SUPABASE_URL");
+  const key = .env.get("SUPABASE_SERVICE_ROLE_KEY");
   if (!url || !key) throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   return createClient(url, key, { auth: { persistSession: false } });
 }
@@ -115,7 +115,7 @@ export default async (req) => {
     if (payout.length > 32) return json(400, { success: false, error: "payout too long" });
 
     // --------------- Optional CPAGrip IP allowlist ---------------
-    const allowedIpsRaw = Netlify.env.get("CPAGRIP_ALLOWED_IPS") || "";
+    const allowedIpsRaw = .env.get("CPAGRIP_ALLOWED_IPS") || "";
     if (allowedIpsRaw.trim()) {
       const allowed = new Set(
         allowedIpsRaw
@@ -130,10 +130,10 @@ export default async (req) => {
     }
 
     // --------------- Auth: HMAC or password ---------------
-    const secret = Netlify.env.get("CPAGRIP_SECRET") || "";
-    const postbackPassword = Netlify.env.get("CPAGRIP_POSTBACK_PASSWORD") || "";
+    const secret = .env.get("CPAGRIP_SECRET") || "";
+    const postbackPassword = .env.get("CPAGRIP_POSTBACK_PASSWORD") || "";
 
-    const requireSig = parseBool(Netlify.env.get("REQUIRE_SIG"), true);
+    const requireSig = parseBool(.env.get("REQUIRE_SIG"), true);
 
     if (requireSig) {
       if (!secret) return json(500, { success: false, error: "Server misconfigured: CPAGRIP_SECRET missing" });
@@ -155,8 +155,8 @@ export default async (req) => {
     }
 
     // --------------- Anti-replay (nonce + timestamp window) ---------------
-    const requireAntiReplay = parseBool(Netlify.env.get("REQUIRE_ANTI_REPLAY"), true);
-    const windowSeconds = parseIntSafe(Netlify.env.get("ANTI_REPLAY_WINDOW_SECONDS") || "300", 300);
+    const requireAntiReplay = parseBool(.env.get("REQUIRE_ANTI_REPLAY"), true);
+    const windowSeconds = parseIntSafe(.env.get("ANTI_REPLAY_WINDOW_SECONDS") || "300", 300);
 
     const nowSec = Math.floor(Date.now() / 1000);
     const ts = tsStr ? parseIntSafe(tsStr, NaN) : NaN;
