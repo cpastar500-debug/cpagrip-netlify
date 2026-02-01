@@ -1,226 +1,224 @@
 // netlify/functions/cpagrip-postback.js
-import crypto from "crypto";
+import crypto from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
-
-// ---- helpers
-function json(statusCode, obj) {
-  return {
-    statusCode,
-    headers: { "content-type": "application/json; charset=utf-8" },
-    body: JSON.stringify(obj),
-  };
+function json(status, payload, extraHeaders = {}) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      ...extraHeaders,
+    },
+  });
 }
 
-// Best-effort client IP extraction behind Netlify
-function getClientIp(event) {
-  const h = event.headers || {};
-  // Netlify sometimes provides x-nf-client-connection-ip (not always documented consistently),
-  // otherwise fall back to x-forwarded-for first hop.
-  const nf = h["x-nf-client-connection-ip"];
+function getClientIp(req) {
+  // Netlify provides this header on Functions
+  const nf = req.headers.get("x-nf-client-connection-ip");
   if (nf) return nf;
 
-  const xff = h["x-forwarded-for"];
-  if (!xff) return null;
+  // Fallback (may contain multiple)
+  const xff = req.headers.get("x-forwarded-for");
+  if (!xff) return "";
   return xff.split(",")[0].trim();
 }
 
-function timingSafeEqual(a, b) {
-  const aa = Buffer.from(a || "", "utf8");
-  const bb = Buffer.from(b || "", "utf8");
+function timingSafeEqualHex(a, b) {
+  const aa = Buffer.from(String(a || ""), "utf8");
+  const bb = Buffer.from(String(b || ""), "utf8");
   if (aa.length !== bb.length) return false;
   return crypto.timingSafeEqual(aa, bb);
 }
 
-// Canonical signing string (stable order)
-function buildSigningString(params) {
-  const keys = Object.keys(params).sort();
-  return keys.map((k) => `${k}=${params[k] ?? ""}`).join("&");
+function hmacSha256Hex(secret, base) {
+  return crypto.createHmac("sha256", secret).update(base).digest("hex");
 }
 
-function hmacSign(str, secret) {
-  return crypto.createHmac("sha256", secret).update(str).digest("hex");
+function parseBool(v, fallback = false) {
+  if (v === undefined || v === null || v === "") return fallback;
+  const s = String(v).trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(s)) return true;
+  if (["0", "false", "no", "off"].includes(s)) return false;
+  return fallback;
 }
 
-// simple allowlist: comma-separated exact IPs
-function ipAllowed(ip) {
-  const allow = (process.env.CPAGRIP_ALLOWED_IPS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-
-  if (allow.length === 0) return true; // if you haven't set an allowlist, don't block
-  if (!ip) return false;
-  return allow.includes(ip);
+function parseIntSafe(v, fallback) {
+  const n = Number.parseInt(String(v), 10);
+  return Number.isFinite(n) ? n : fallback;
 }
 
-// Optional: TikTok server-side call (you must fill these env vars)
-async function sendTikTokEvent({ tracking_id, offer_id, payout }) {
-  const pixelId = process.env.TIKTOK_PIXEL_ID;
-  const accessToken = process.env.TIKTOK_ACCESS_TOKEN;
+async function readBodyParams(req) {
+  if (req.method !== "POST") return {};
+  const ct = (req.headers.get("content-type") || "").toLowerCase();
+  const text = await req.text();
+  if (!text) return {};
 
-  if (!pixelId || !accessToken) return { skipped: true };
-
-  // This is intentionally generic because TikTok payload requirements can vary by account/setup.
-  // You typically want event_name + event_time + event_id + context/user data if available.
-  const payload = {
-    pixel_code: pixelId,
-    event: "CompletePayment",
-    event_id: `cpagrip_${tracking_id}_${offer_id || "na"}`,
-    timestamp: Math.floor(Date.now() / 1000),
-    properties: {
-      value: payout ? Number(payout) : undefined,
-      currency: "USD",
-      offer_id,
-      tracking_id,
-    },
-  };
-
-  // NOTE: Use the correct TikTok endpoint for your integration type.
-  // Many teams use TikTok Events API (server-side) rather than browser pixel.
-  // Concept overview / setup references: :contentReference[oaicite:1]{index=1}
-
-  const res = await fetch("https://business-api.tiktok.com/open_api/v1.3/pixel/track/", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "access-token": accessToken,
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const text = await res.text().catch(() => "");
-  return { ok: res.ok, status: res.status, body: text.slice(0, 500) };
-}
-
-export async function handler(event) {
-  try {
-    const method = event.httpMethod || "GET";
-    if (method !== "GET" && method !== "POST") {
-      return json(405, { success: false, error: "Method not allowed" });
+  if (ct.includes("application/json")) {
+    try {
+      const data = JSON.parse(text);
+      return data && typeof data === "object" ? data : {};
+    } catch {
+      return {};
     }
-
-    // Collect params from query + JSON body (if any)
-    const query = event.queryStringParameters || {};
-    let body = {};
-    if (method === "POST" && event.body) {
-      try {
-        body = event.isBase64Encoded
-          ? JSON.parse(Buffer.from(event.body, "base64").toString("utf8"))
-          : JSON.parse(event.body);
-      } catch {
-        // ignore bad JSON, still allow querystring based postbacks
-      }
-    }
-
-    const p = { ...query, ...body };
-
-    // Required params
-    const tracking_id = p.tracking_id;
-    const offer_id = p.offer_id || null;
-    const payout = p.payout || null;
-
-    // Auth params
-    const password = p.password;
-    const ts = p.ts ? Number(p.ts) : null;
-    const nonce = p.nonce || null;
-    const sig = p.sig || null;
-
-    // 1) Basic checks
-    if (!tracking_id) return json(400, { success: false, error: "tracking_id missing" });
-
-    // 2) Password check (your current behavior)
-    if (password !== process.env.CPAGRIP_POSTBACK_PASSWORD) {
-      return json(403, { success: false, error: "Forbidden" });
-    }
-
-    // 3) Optional IP allowlist
-    const ip = getClientIp(event);
-    if (!ipAllowed(ip)) {
-      return json(403, { success: false, error: "IP not allowed" });
-    }
-
-    // 4) Anti-replay (recommended)
-    // If you haven't started sending ts/nonce/sig yet, you can temporarily skip by not requiring them.
-    const requireReplayProtection = process.env.REQUIRE_ANTI_REPLAY === "true";
-
-    if (requireReplayProtection) {
-      if (!ts || !nonce || !sig) {
-        return json(400, { success: false, error: "ts/nonce/sig required" });
-      }
-
-      const now = Math.floor(Date.now() / 1000);
-      if (Math.abs(now - ts) > 300) {
-        return json(400, { success: false, error: "timestamp expired" });
-      }
-
-      // Check nonce not used
-      const { data: existing } = await supabase
-        .from("used_nonces")
-        .select("nonce")
-        .eq("nonce", nonce)
-        .maybeSingle();
-
-      if (existing) {
-        return json(409, { success: false, error: "replay detected" });
-      }
-
-      // Verify HMAC signature
-      const signingParams = {
-        tracking_id,
-        offer_id: offer_id || "",
-        payout: payout || "",
-        ts,
-        nonce,
-      };
-
-      const signingString = buildSigningString(signingParams);
-      const expected = hmacSign(signingString, process.env.POSTBACK_HMAC_SECRET);
-
-      if (!timingSafeEqual(sig, expected)) {
-        return json(403, { success: false, error: "bad signature" });
-      }
-
-      // Store nonce as used
-      await supabase.from("used_nonces").insert({ nonce });
-    }
-
-    // 5) Insert conversion (dedupe via unique constraint)
-    const userAgent = (event.headers && (event.headers["user-agent"] || event.headers["User-Agent"])) || null;
-
-    const conversionRow = {
-      tracking_id,
-      offer_id,
-      payout: payout ? Number(payout) : null,
-      status: "received",
-      source_ip: ip,
-      user_agent: userAgent,
-      raw: p,
-      nonce: nonce || null,
-      ts: ts || null,
-    };
-
-    const insertRes = await supabase.from("conversions").insert(conversionRow).select().maybeSingle();
-
-    // If unique constraint trips, Supabase may return an error; treat as already logged
-    let conversionId = insertRes?.data?.id || null;
-
-    // 6) Optional: send TikTok server-side event
-    const tiktok = await sendTikTokEvent({ tracking_id, offer_id, payout });
-
-    return json(200, {
-      success: true,
-      tracking_id,
-      offer_id,
-      payout,
-      conversion_id: conversionId,
-      tiktok,
-    });
-  } catch (e) {
-    return json(500, { success: false, error: "Server error", detail: String(e?.message || e) });
   }
+
+  if (ct.includes("application/x-www-form-urlencoded")) {
+    return Object.fromEntries(new URLSearchParams(text));
+  }
+
+  return {};
 }
+
+function getSupabase() {
+  const url = Netlify.env.get("SUPABASE_URL");
+  const key = Netlify.env.get("SUPABASE_SERVICE_ROLE_KEY");
+  if (!url || !key) throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+  return createClient(url, key, { auth: { persistSession: false } });
+}
+
+export default async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "access-control-allow-origin": "*",
+        "access-control-allow-methods": "GET, POST, OPTIONS",
+        "access-control-allow-headers": "content-type",
+      },
+    });
+  }
+
+  if (req.method !== "GET" && req.method !== "POST") {
+    return json(405, { success: false, error: "Method not allowed" });
+  }
+
+  try {
+    const url = new URL(req.url);
+    const queryParams = Object.fromEntries(url.searchParams.entries());
+    const bodyParams = await readBodyParams(req);
+    const params = { ...queryParams, ...bodyParams };
+
+    const tracking_id = String(params.tracking_id || "").trim();
+    const offer_id = String(params.offer_id || "").trim();
+    const payoutRaw = params.payout;
+    const payout = payoutRaw === undefined || payoutRaw === null || payoutRaw === "" ? "" : String(payoutRaw).trim();
+
+    const tsStr = String(params.ts || "").trim();
+    const nonce = String(params.nonce || "").trim();
+    const sig = String(params.sig || "").trim();
+    const password = String(params.password || "").trim();
+
+    // --------------- Basic validation ---------------
+    if (!tracking_id) return json(400, { success: false, error: "tracking_id required" });
+    if (tracking_id.length > 128) return json(400, { success: false, error: "tracking_id too long" });
+    if (offer_id.length > 128) return json(400, { success: false, error: "offer_id too long" });
+    if (payout.length > 32) return json(400, { success: false, error: "payout too long" });
+
+    // --------------- Optional CPAGrip IP allowlist ---------------
+    const allowedIpsRaw = Netlify.env.get("CPAGRIP_ALLOWED_IPS") || "";
+    if (allowedIpsRaw.trim()) {
+      const allowed = new Set(
+        allowedIpsRaw
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+      );
+      const ip = getClientIp(req);
+      if (!ip || !allowed.has(ip)) {
+        return json(403, { success: false, error: "Forbidden" });
+      }
+    }
+
+    // --------------- Auth: HMAC or password ---------------
+    const secret = Netlify.env.get("CPAGRIP_SECRET") || "";
+    const postbackPassword = Netlify.env.get("CPAGRIP_POSTBACK_PASSWORD") || "";
+
+    const requireSig = parseBool(Netlify.env.get("REQUIRE_SIG"), true);
+
+    if (requireSig) {
+      if (!secret) return json(500, { success: false, error: "Server misconfigured: CPAGRIP_SECRET missing" });
+      if (!tsStr || !nonce || !sig) return json(403, { success: false, error: "Forbidden" });
+
+      const base = [tracking_id, offer_id, payout, tsStr, nonce].join("|");
+      const expected = hmacSha256Hex(secret, base);
+      if (!timingSafeEqualHex(expected, sig)) {
+        return json(403, { success: false, error: "Forbidden" });
+      }
+    } else if (postbackPassword) {
+      // password mode (works with networks that can't do HMAC)
+      if (!password || password !== postbackPassword) {
+        return json(403, { success: false, error: "Forbidden" });
+      }
+    } else {
+      // If you disable sig and don't set a password, you're effectively unauthenticated.
+      return json(500, { success: false, error: "Server misconfigured: no auth enabled" });
+    }
+
+    // --------------- Anti-replay (nonce + timestamp window) ---------------
+    const requireAntiReplay = parseBool(Netlify.env.get("REQUIRE_ANTI_REPLAY"), true);
+    const windowSeconds = parseIntSafe(Netlify.env.get("ANTI_REPLAY_WINDOW_SECONDS") || "300", 300);
+
+    const nowSec = Math.floor(Date.now() / 1000);
+    const ts = tsStr ? parseIntSafe(tsStr, NaN) : NaN;
+
+    if (requireAntiReplay) {
+      if (!nonce || nonce.length > 128) return json(400, { success: false, error: "Invalid nonce" });
+      if (!Number.isFinite(ts)) return json(400, { success: false, error: "Invalid ts" });
+
+      const delta = Math.abs(nowSec - ts);
+      if (delta > windowSeconds) {
+        return json(403, { success: false, error: "Expired" });
+      }
+    }
+
+    const supabase = getSupabase();
+
+    // Record nonce first (replay detection)
+    if (requireAntiReplay) {
+      const { error: nonceErr } = await supabase
+        .from("postback_nonces")
+        .insert([{ nonce, tracking_id, ts }]);
+
+      // 23505 = unique violation (nonce already used)
+      if (nonceErr && nonceErr.code === "23505") {
+        // replay — return success so networks don't keep hammering you
+        return json(200, { success: true, replay: true });
+      }
+      if (nonceErr) {
+        console.error("nonce insert error", nonceErr);
+        return json(500, { success: false, error: "DB error" });
+      }
+    }
+
+    // --------------- Insert conversion (strict 1 per tracking_id) ---------------
+    // Store payout as numeric when provided; otherwise null.
+    const payoutNum = payout === "" ? null : Number(payout);
+    const safePayout = Number.isFinite(payoutNum) ? payoutNum : null;
+
+    const { error: convErr } = await supabase
+      .from("conversions")
+      .insert([
+        {
+          tracking_id,
+          offer_id: offer_id || null,
+          payout: safePayout,
+          status: "completed",
+        },
+      ]);
+
+    if (convErr && convErr.code === "23505") {
+      // tracking_id already exists -> dedupe (still return success)
+      return json(200, { success: true, deduped: true });
+    }
+
+    if (convErr) {
+      console.error("conversion insert error", convErr);
+      return json(500, { success: false, error: "DB error" });
+    }
+
+    return json(200, { success: true });
+  } catch (err) {
+    console.error("cpagrip-postback error", err);
+    return json(500, { success: false, error: "Server error" });
+  }
+};
