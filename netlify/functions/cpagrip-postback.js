@@ -12,6 +12,12 @@ function json(status, payload, extraHeaders = {}) {
   });
 }
 
+function env(key, fallback = undefined) {
+  // Works in local netlify dev + production
+  return (globalThis.Netlify?.env?.[key]) ?? process.env[key] ?? fallback;
+}
+
+
 function getClientIp(req) {
   // Netlify provides this header on Functions
   const nf = req.headers.get("x-nf-client-connection-ip");
