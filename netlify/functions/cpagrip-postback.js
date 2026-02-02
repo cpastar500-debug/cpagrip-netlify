@@ -100,6 +100,13 @@ export async function handler(event) {
       sig,
     } = incoming;
 
+    if (!secret) {
+  // In production you probably have REQUIRE_SIG=false anyway,
+  // but this avoids unsafe defaults and prevents secret scan issues.
+  throw new Error("CPAGRIP_SECRET env var is missing");
+}
+
+
     if (!tracking_id) return json200({ success: false, error: "missing_tracking_id" });
 
     // ---- AUTH MODES ----
