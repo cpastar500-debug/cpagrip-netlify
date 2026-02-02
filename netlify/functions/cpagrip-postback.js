@@ -65,7 +65,7 @@ function parseIncoming(event) {
 }
 
 function verifyHmac({ tracking_id, offer_id, payout, ts, nonce, sig }) {
-  const secret = process.env.CPAGRIP_SECRET || "cpagrip_secret_2026";
+  const secret = process.env.CPAGRIP_SECRET;
 
   // IMPORTANT: order must match your client/baseString order
   const baseString =
